@@ -38,6 +38,7 @@ class TrackMerger:
             self.counter[str(t1.id) + '$' + str(t2.id)] += 1
             if self.counter[str(t1.id) + '$' + str(t2.id)] >= self.interval * self.limit:
                 dereg_func(t2.id)
+                t2.is_merged = True
 
         res = [val for val in tracks if val.is_active]
         if len(res) == 0:

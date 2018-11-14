@@ -6,12 +6,20 @@ from typing import DefaultDict
 import cv2
 import numpy as np
 from scipy.spatial import distance as dist
-from track import Track
-from track_merger import TrackMerger
+from tracker.track import Track
+from tracker.track_merger import TrackMerger
+import logging
 
+logger = logging.getLogger('Tracker')
+logger.setLevel(logging.DEBUG)
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)
+formatter = logging.Formatter('[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
 
 class DetectionBasedTracker:
-    def __init__(self, tracker_type='KCF', merge_interval=40, merge_max_perc=0.4, max_disappear=20,
+    def __init__(self, tracker_type='CSRT', merge_interval=40, merge_max_perc=0.4, max_disappear=20,
                  iou_thresh=0.6):
         self.id_to_trackers = OrderedDict()
         self.disappeared = OrderedDict()
@@ -39,14 +47,41 @@ class DetectionBasedTracker:
             return cv2.TrackerMedianFlow_create()
         elif tracker_type == 'GOTURN':
             return cv2.TrackerGOTURN_create()
+        elif tracker_type == 'CSRT':
+            return cv2.TrackerCSRT_create()
         else:
             raise Exception('incorrect tracker')
 
+
     def update(self, frame, bbs, frame_cnt):
+        """
+        :param frame: img
+        :param bbs: [[x,y,w,h]]
+        :param frame_cnt: current frame number
+        :return: list of trackers that are corresp. to bbs
+        """
         self.last_deleted = []
         self.last_registered = []
 
-        if len(self.id_to_trackers) == 0:
+        tracks_bbs = []
+        track_bbs_to_track = {}
+        track_bbs_cntr = 0
+        for id, track in self.id_to_trackers.copy().items():
+            ok, bbox = track.tracker.update(frame)
+            if not ok:
+                #logger.error('not ok')
+                self.disappeared[id] += 1
+                if self.disappeared[id] > self.max_disappear:
+                    self.deregister(id)
+            else:
+                #logger.debug('OK')
+                track.last_tracker_bb = bbox
+                tracks_bbs.append(bbox)
+                track_bbs_to_track[track_bbs_cntr] = track
+                track_bbs_cntr += 1
+
+
+        if len(tracks_bbs) == 0 or len(bbs) == 0:
             res = []
             for i in range(0, len(bbs)):
                 res.append([self.register(frame, bbs[i])])
@@ -54,18 +89,8 @@ class DetectionBasedTracker:
 
             return res
         else:
-            tracks_bbs = []
             res_bb_to_track_dict = collections.defaultdict(list)
-            for id, track in self.id_to_trackers.items():
-                ok, bbox = track.tracker.update(frame)
-                if not ok:
-                    self.disappeared[id] += 1
-                    if self.disappeared[id] > self.max_disappear:
-                        self.deregister(id)
-                else:
-                    tracks_bbs.append(bbox)
 
-            tracks_ids = list(self.id_to_trackers.keys())
             D = 1. - dist.cdist(np.asarray(tracks_bbs), np.array(bbs), metric=self.bb_intersection_over_union)
 
             # in order to perform this matching we must (1) find the
@@ -95,7 +120,7 @@ class DetectionBasedTracker:
                 # otherwise, grab the object ID for the current row,
                 # set its new centroid, and reset the disappeared
                 # counter
-                id = tracks_ids[row]
+                id = track_bbs_to_track[row].id
                 self.id_to_trackers[id].path.append(bbs[col])
                 self.disappeared[id] = 0
                 res_bb_to_track_dict[col].append(self.id_to_trackers[id])
@@ -112,19 +137,19 @@ class DetectionBasedTracker:
             unusedRows = set(range(0, D.shape[0])).difference(usedRows)
             unusedCols = set(range(0, D.shape[1])).difference(usedCols)
 
-            if D.shape[0] >= D.shape[1]:
-                # loop over the unused row indexes
-                for row in unusedRows:
-                    id = tracks_ids[row]
-                    self.disappeared[id] += 1
 
-                    if self.disappeared[id] > self.max_disappear:
-                        self.deregister(id)
+            # loop over the unused row indexes
+            for row in unusedRows:
+                id = track_bbs_to_track[row].id
+                self.disappeared[id] += 1
 
-            else:
-                for col in unusedCols:
-                    res_bb_to_track_dict[col].append(self.register(frame, bbs[col]))
+                if self.disappeared[id] > self.max_disappear:
+                    self.deregister(id)
 
+            for col in unusedCols:
+                res_bb_to_track_dict[col].append(self.register(frame, bbs[col]))
+
+            assert len(res_bb_to_track_dict) == len(bbs)
             res_bb_to_track_dict = OrderedDict(sorted(res_bb_to_track_dict.items()))
             self.merge_trackers(res_bb_to_track_dict, frame_cnt)
 
@@ -145,6 +170,7 @@ class DetectionBasedTracker:
         tracker = self.create_tracker()
         tracker.init(frame, tuple(bb))
         res = self.id_to_trackers[self.cntr] = Track(self.cntr, tracker)
+        res.last_tracker_bb = bb
         self.disappeared[self.cntr] = 0
         self.last_registered.append(res)
         self.cntr += 1
@@ -161,6 +187,8 @@ class DetectionBasedTracker:
     @staticmethod
     def bb_intersection_over_union(boxA, boxB):
         # determine the (x, y)-coordinates of the intersection rectangle
+        boxA = boxA[0], boxA[1], boxA[0] + boxA[2], boxA[1] + boxA[3]
+        boxB = boxB[0], boxB[1], boxB[0] + boxB[2], boxB[1] + boxB[3]
         xA = max(boxA[0], boxB[0])
         yA = max(boxA[1], boxB[1])
         xB = min(boxA[2], boxB[2])
